@@ -1,0 +1,25 @@
+[run]
+name = "ml_data_v0"
+
+[run_type]
+ensemble = true
+
+[params]
+num_time_steps = 100
+sd_degree = 151 
+st_max = 4
+solver = "dopri5"
+
+[ensemble]
+num_samples = 1024 
+batch_size = 64
+use_coriolis = true 
+seed = 42
+
+[single]
+grad_u = [
+    [1.0, 0.0, 0.0],
+    [0.0, -0.5, 0.0],
+    [0.0, 0.0, -0.5],
+]
+omega = [0.0, 0.0, 0.0]

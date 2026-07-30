@@ -1,0 +1,16 @@
+# only keep figures 
+results/**
+!results/**/
+!results/**/*.svg
+!results/**/*.csv
+
+grids/ 
+
+# python
+__pycache__/
+*.py[cod]
+
+# macOS
+.DS_Store 
+
+CLAUDE.md 
