@@ -136,7 +136,7 @@ def plot_sum_spectra(
         plt.plot(x_val, sum_phi, "-" + colors[i], label=rf"$t = {t}$")
     plt.xlabel(r"$s$")
     plt.ylabel(r"$E_{\phi}^{<}/E_{\phi}$")
-    plt.legend(ncol=2, loc="lower left")
+    #plt.legend(ncol=2, loc="lower left")
     plt.grid()
     plt.tight_layout()
     plt.savefig(results_dir / "sum_spectra.svg")
