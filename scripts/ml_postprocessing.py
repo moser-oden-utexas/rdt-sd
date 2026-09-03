@@ -29,11 +29,7 @@ from src.barycentric_plots import (
     barycentric_map_outline,
     barycentric_map_point,
 )
-from src.sampler import (
-    generate_coriolis_terms,
-    generate_mean_velocity_gradients,
-    sampling_parameters,
-)
+from src.sampler import resolve_case_parameters
 
 logger = logging.getLogger(__name__)
 
@@ -92,12 +88,18 @@ def load_normalized_tensors(structure_tensors: Path) -> dict[str, np.ndarray]:
     return normalized
 
 
-def load_case_parameters(config: Path) -> tuple[np.ndarray, np.ndarray | None]:
+def case_parameters_from_config(config: Path) -> tuple[np.ndarray, np.ndarray | None]:
     """
     Reconstructs per-case mean velocity gradients and Coriolis terms.
 
-    Repeats the sampling done by scripts/launcher.py, which derives both from the
-    Sobol sequence and does not save them.
+    Repeats the case resolution done by scripts/launcher.py, which does not save
+    the resolved values. Cases are re-sampled from the Sobol sequence, or reloaded
+    from `grad_u_location`/`coriolis_location` when the config carries them. When
+    the config carries `case_offset`/`total_num_samples` (written for a run that is
+    one disjoint slice of a larger shared pool, e.g. scripts/build_ml_datasets.py),
+    the full pool is resolved and then sliced down to this run's `num_samples`,
+    starting at `case_offset`. Both default to single-run behavior (offset 0, total
+    equal to num_samples) when absent.
 
     Args:
         config (Path): Launcher toml config used to generate the run.
@@ -108,7 +110,8 @@ def load_case_parameters(config: Path) -> tuple[np.ndarray, np.ndarray | None]:
             when the run did not use Coriolis.
 
     Raises:
-        ValueError: If the config does not describe an ensemble run.
+        ValueError: If the config does not describe an ensemble run, or if the
+            resolved pool does not cover this run's slice.
     """
     with open(config, "rb") as f:
         launcher_config = tomllib.load(f)
@@ -118,14 +121,27 @@ def load_case_parameters(config: Path) -> tuple[np.ndarray, np.ndarray | None]:
 
     ensemble = launcher_config["ensemble"]
     use_coriolis = ensemble["use_coriolis"]
+    num_samples = ensemble["num_samples"]
+    total_num_samples = ensemble.get("total_num_samples", num_samples)
+    case_offset = ensemble.get("case_offset", 0)
 
-    sampling_params = sampling_parameters(
-        ensemble["num_samples"], 1, seed=ensemble["seed"]
+    mean_velocity_gradients, coriolis_terms = resolve_case_parameters(
+        total_num_samples,
+        use_coriolis,
+        seed=ensemble["seed"],
+        grad_u_location=ensemble.get("grad_u_location"),
+        coriolis_location=ensemble.get("coriolis_location"),
     )
-    mean_velocity_gradients = generate_mean_velocity_gradients(sampling_params[:, :4])
-    coriolis_terms = (
-        generate_coriolis_terms(sampling_params[:, 4:]) if use_coriolis else None
-    )
+
+    if mean_velocity_gradients.shape[0] < case_offset + num_samples:
+        raise ValueError(
+            f"Resolved case pool holds {mean_velocity_gradients.shape[0]} cases, but "
+            f"this run covers cases [{case_offset}, {case_offset + num_samples})."
+        )
+
+    case_slice = slice(case_offset, case_offset + num_samples)
+    mean_velocity_gradients = mean_velocity_gradients[case_slice]
+    coriolis_terms = coriolis_terms[case_slice] if coriolis_terms is not None else None
 
     return mean_velocity_gradients, coriolis_terms
 
@@ -323,10 +339,10 @@ def main(
 
     stops = validate_es_array(np.load(es_array), num_cases, num_time_steps)
 
-    mean_velocity_gradients, coriolis_terms = load_case_parameters(config)
+    mean_velocity_gradients, coriolis_terms = case_parameters_from_config(config)
     if mean_velocity_gradients.shape[0] != num_cases:
         raise ValueError(
-            f"Config samples {mean_velocity_gradients.shape[0]} cases, but the "
+            f"Config resolves {mean_velocity_gradients.shape[0]} cases, but the "
             f"structure tensors cover {num_cases}."
         )
 

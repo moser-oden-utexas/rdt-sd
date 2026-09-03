@@ -144,6 +144,82 @@ def split_solution(sol):
     return phi, k
 
 
+def join_solution(phi, kappa):
+    """From phi (3, 3, b, t, k) and kappa (3, b, t, k) to sol (b, t, 9, k)."""
+    xp = get_array_module(phi)
+    _, _, b, t, k = phi.shape
+    sol = xp.zeros([b, t, 9, k], dtype=phi.dtype)
+    sol[:, :, 0, :] = phi[0, 0]
+    sol[:, :, 1, :] = phi[1, 1]
+    sol[:, :, 2, :] = phi[2, 2]
+    sol[:, :, 3, :] = phi[0, 1]
+    sol[:, :, 4, :] = phi[0, 2]
+    sol[:, :, 5, :] = phi[1, 2]
+    sol[:, :, 6:, :] = rearrange(kappa, "i b t k -> b t i k")
+    return sol
+
+
+def isotropic_spectrum(kappa: np.ndarray) -> np.ndarray:
+    """
+    Computes closed-form isotropic model spectrum at wavenumber kappa.
+
+    Args:
+        kappa (np.ndarray): Wavenumber vector, shape (3, ...).
+
+    Returns:
+        np.ndarray: Isotropic spectrum tensor, shape (3, 3, ...).
+    """
+    xp = get_array_module(kappa)
+    kk = xp.sum(kappa**2, axis=0)
+    identity = xp.eye(3).reshape((3, 3) + (1,) * (kappa.ndim - 1))
+    projection = identity - xp.einsum("i...,j...->ij...", kappa, kappa) / kk
+    energy = 3 / (8 * xp.pi) * (kk + 1) ** (-11 / 6)
+    return energy[None, None] * projection
+
+
+def eddy_turnover_time(kappa: np.ndarray) -> np.ndarray:
+    """
+    Computes eddy turnover time at wavenumber kappa.
+
+    Args:
+        kappa (np.ndarray): Wavenumber vector, shape (3, ...).
+
+    Returns:
+        np.ndarray: Eddy turnover time, shape (...,).
+    """
+    xp = get_array_module(kappa)
+    kk = xp.sum(kappa**2, axis=0)
+    return kk ** (-1 / 3)
+
+
+def model_spectrum(sol: np.ndarray, mean_velocity_gradient: np.ndarray) -> np.ndarray:
+    """
+    Blends RDT-solved spectrum with isotropic model spectrum.
+
+    Blends phi_aniso, the RDT-solved spectrum, with phi_iso, the closed-form
+    isotropic spectrum, weighting each wavenumber shell by the strain undergone
+    over its local eddy turnover time.
+
+    Args:
+        sol (np.ndarray): Solution array, shape (batch, time, 9, k).
+        mean_velocity_gradient (np.ndarray): Velocity-gradient tensor per case,
+            shape (batch, 3, 3).
+
+    Returns:
+        np.ndarray: Model-spectrum solution array, shape (batch, time, 9, k),
+        with kappa channels unchanged.
+    """
+    phi_aniso, kappa = split_solution(sol)
+    phi_iso = isotropic_spectrum(kappa)
+    tau = eddy_turnover_time(kappa)
+    S = strain_rate(mean_velocity_gradient)
+
+    weight_iso = np.exp(-S[:, None, None] * tau)
+    phi_model = (1 - weight_iso)[None, None] * phi_aniso + weight_iso[None, None] * phi_iso
+
+    return join_solution(phi_model, kappa)
+
+
 def get_R_ij(sol):
     """From sol (b, t, 9, k) to R_ij (3, 3, b, t)."""
     xp = get_array_module(sol)

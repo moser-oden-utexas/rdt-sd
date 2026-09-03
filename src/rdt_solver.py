@@ -49,11 +49,13 @@ def _project_div_free(y: jnp.ndarray) -> jnp.ndarray:
 
 
 def _rhs_tau_k(
-    tau: float, y: jnp.ndarray, args: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]
+    tau: float,
+    y: jnp.ndarray,
+    args: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, bool],
 ) -> jnp.ndarray:
     """Computes dy/dτ = tmax * dy/dt; y has shape (9,)."""
     # unpack arguments
-    grad_u, omega, tmax = args  # (3, 3), (3,), float
+    grad_u, omega, tmax, evolve_k = args  # (3, 3), (3,), float, bool
     phi = _unpack_phi(y[:6])  # (3, 3)
     k = y[6:]
     kk = jnp.dot(k, k)
@@ -66,8 +68,8 @@ def _rhs_tau_k(
     w = _skew(omega)
     dphi += -2.0 * (w @ phi + phi @ w.T)
 
-    # compute dk/dτ
-    dk = -k @ grad_u
+    # compute dk/dτ, frozen at Y0 when evolve_k is disabled
+    dk = -k @ grad_u if evolve_k else jnp.zeros_like(k)
 
     rhs = jnp.concatenate([_pack_phi(dphi), dk])
     return tmax * rhs
@@ -79,8 +81,19 @@ def _rhs_tau(
     """Evaluates rhs per wavenumber and stacks back to (9, k)."""
     return jax.vmap(_rhs_tau_k, in_axes=(None, 1, None), out_axes=1)(tau, y, args)
 
-def _load_y0(sd_degree: int) -> jnp.ndarray:
-    """Builds initial state Y0 with shape (9, n_wavevectors)."""
+def initial_state(sd_degree: int) -> jnp.ndarray:
+    """
+    Builds undeformed solver state Y0 with shape (9, n_wavevectors).
+
+    Rows 0:6 hold the packed isotropic spectrum I - kk / |k|^2, rows 6:9 hold
+    the spherical-design wavevectors on the unit sphere.
+
+    Args:
+        sd_degree (int): Spherical design degree, sets initial spectrum and wavevectors.
+
+    Returns:
+        jnp.ndarray: Initial state, shape (9, n_wavevectors).
+    """
     karr, _ = init_wavenumbers_spherical_designs(sd_degree)
     K0 = jnp.asarray(karr.T)
     K0K0 = jnp.sum(K0 * K0, axis=0)
@@ -98,9 +111,10 @@ def _solve_single(
     tm: jnp.ndarray,
     tau_eval: jnp.ndarray,
     solver: str,
+    evolve_k: bool,
 ) -> jnp.ndarray:
     """Integrates one case over tau_eval; returns shape (num_time_steps, 9, n_wavevectors)."""
-    args = (g_u, om, tm)
+    args = (g_u, om, tm, evolve_k)
     t0 = tau_eval[0]
 
     def step(carry, t_next):
@@ -133,7 +147,7 @@ def _solve_single(
     return jnp.concatenate([Y0[None, ...], ys], axis=0)
 
 
-@partial(jax.jit, static_argnums=(2, 4, 5))
+@partial(jax.jit, static_argnums=(2, 4, 5, 6))
 def simulate_parallel(
     grad_u: np.ndarray | jnp.ndarray,
     tmax: np.ndarray | jnp.ndarray,
@@ -141,6 +155,7 @@ def simulate_parallel(
     omega: np.ndarray | jnp.ndarray | None = None,
     sd_degree: int = 109,
     solver: str = "dopri5",
+    evolve_k: bool = True,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """
     Simulates RDT spectra for multiple cases in parallel with normalized time.
@@ -154,6 +169,9 @@ def simulate_parallel(
         solver: integration scheme, "dopri5" (adaptive, diffrax Dopri5 +
             PIDController) or "rk4" (fixed-step classical RK4, one step
             per save interval). Defaults to "dopri5".
+        evolve_k: whether wavevectors evolve under grad_u. When False,
+            wavevectors stay frozen at their sd_degree-derived initial values.
+            Defaults to True.
 
     Returns:
         sol: shape (batch, num_time_steps, 9, n_wavevectors)
@@ -165,7 +183,7 @@ def simulate_parallel(
     if solver not in ("dopri5", "rk4"):
         raise ValueError(f'Unknown solver: {solver!r}. Expected "dopri5" or "rk4".')
 
-    Y0 = _load_y0(sd_degree)
+    Y0 = initial_state(sd_degree)
 
     grad_u_b = jnp.asarray(grad_u)
     tmax_b = jnp.asarray(tmax)
@@ -183,7 +201,9 @@ def simulate_parallel(
 
     tau_eval = jnp.linspace(0.0, 1.0, num_time_steps)
 
-    solve_single = lambda g_u, om, tm: _solve_single(Y0, g_u, om, tm, tau_eval, solver)
+    solve_single = lambda g_u, om, tm: _solve_single(
+        Y0, g_u, om, tm, tau_eval, solver, evolve_k
+    )
     sol = jax.vmap(solve_single, in_axes=(0, 0, 0), out_axes=0)(
         grad_u_b, omega_b, tmax_b
     )
@@ -193,7 +213,63 @@ def simulate_parallel(
     return sol, t_actual
 
 
-@partial(jax.jit, static_argnums=(2, 4, 5))
+@partial(jax.jit, static_argnums=(5, 6))
+def simulate_from_state(
+    Y0: np.ndarray | jnp.ndarray,
+    grad_u: np.ndarray | jnp.ndarray,
+    tmax: np.ndarray | jnp.ndarray,
+    tau_eval: np.ndarray | jnp.ndarray,
+    omega: np.ndarray | jnp.ndarray | None = None,
+    solver: str = "dopri5",
+    evolve_k: bool = True,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    Simulates RDT spectrum for a single case from an explicit initial state.
+
+    Restart seam for compound distortions: the rhs is autonomous and the state
+    is complete, so the final state of one solve is a valid Y0 for the next
+    solve under a different mean velocity gradient.
+
+    Args:
+        Y0 (np.ndarray | jnp.ndarray): Initial solver state, shape (9, n_wavevectors).
+        grad_u (np.ndarray | jnp.ndarray): Velocity-gradient tensor, shape (3, 3).
+        tmax (np.ndarray | jnp.ndarray): Physical time spanned by tau in [0, 1], scalar.
+        tau_eval (np.ndarray | jnp.ndarray): Ascending normalized times in [0, 1]
+            at which the state is saved, shape (n_nodes,). Must start at 0.
+        omega (np.ndarray | jnp.ndarray | None, optional): Coriolis rotation
+            vector, shape (3,). Defaults to None, meaning no rotation.
+        solver (str, optional): Integration scheme, "dopri5" or "rk4". Defaults
+            to "dopri5".
+        evolve_k (bool, optional): Whether wavevectors evolve under grad_u.
+            Defaults to True.
+
+    Returns:
+        tuple[jnp.ndarray, jnp.ndarray]: Spectrum array, shape
+            (n_nodes, 9, n_wavevectors), and physical times, shape (n_nodes,).
+
+    Raises:
+        ValueError: If solver is not "dopri5" or "rk4".
+    """
+    if solver not in ("dopri5", "rk4"):
+        raise ValueError(f'Unknown solver: {solver!r}. Expected "dopri5" or "rk4".')
+
+    Y0_s = jnp.asarray(Y0)
+    grad_u_s = jnp.asarray(grad_u)
+    tmax_s = jnp.asarray(tmax)
+    tau_eval_s = jnp.asarray(tau_eval)
+    omega_s = (
+        jnp.zeros(3, dtype=grad_u_s.dtype)
+        if omega is None
+        else jnp.asarray(omega, dtype=grad_u_s.dtype)
+    )
+
+    sol = _solve_single(Y0_s, grad_u_s, omega_s, tmax_s, tau_eval_s, solver, evolve_k)
+    t_actual = tau_eval_s * tmax_s
+
+    return sol, t_actual
+
+
+@partial(jax.jit, static_argnums=(2, 4, 5, 6))
 def simulate_single(
     grad_u: np.ndarray | jnp.ndarray,
     tmax: np.ndarray | jnp.ndarray,
@@ -201,6 +277,7 @@ def simulate_single(
     omega: np.ndarray | jnp.ndarray | None = None,
     sd_degree: int = 109,
     solver: str = "dopri5",
+    evolve_k: bool = True,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """
     Simulates RDT spectrum for a single case with normalized time.
@@ -214,6 +291,9 @@ def simulate_single(
         solver: integration scheme, "dopri5" (adaptive, diffrax Dopri5 +
             PIDController) or "rk4" (fixed-step classical RK4, one step
             per save interval). Defaults to "dopri5".
+        evolve_k: whether wavevectors evolve under grad_u. When False,
+            wavevectors stay frozen at their sd_degree-derived initial values.
+            Defaults to True.
 
     Returns:
         sol: shape (num_time_steps, 9, n_wavevectors)
@@ -222,22 +302,14 @@ def simulate_single(
     Raises:
         ValueError: if solver is not "dopri5" or "rk4".
     """
-    if solver not in ("dopri5", "rk4"):
-        raise ValueError(f'Unknown solver: {solver!r}. Expected "dopri5" or "rk4".')
-
-    Y0 = _load_y0(sd_degree)
-
-    grad_u_s = jnp.asarray(grad_u)
-    tmax_s = jnp.asarray(tmax)
-    omega_s = (
-        jnp.zeros(3, dtype=grad_u_s.dtype)
-        if omega is None
-        else jnp.asarray(omega, dtype=grad_u_s.dtype)
-    )
-
     tau_eval = jnp.linspace(0.0, 1.0, num_time_steps)
 
-    sol = _solve_single(Y0, grad_u_s, omega_s, tmax_s, tau_eval, solver)
-    t_actual = tau_eval * tmax_s
-
-    return sol, t_actual
+    return simulate_from_state(
+        initial_state(sd_degree),
+        grad_u,
+        tmax,
+        tau_eval,
+        omega,
+        solver,
+        evolve_k,
+    )

@@ -1,25 +1,44 @@
 [run]
-name = "ml_data_v0"
+name = "prfluids_ss"
 
 [run_type]
-ensemble = true
+ensemble = false
+stages = true
 
 [params]
 num_time_steps = 100
-sd_degree = 151 
-st_max = 4
+sd_degree = 325
+st_max = 5
 solver = "dopri5"
+evolve_k = true 
 
 [ensemble]
-num_samples = 1024 
+num_samples = 1024
 batch_size = 64
-use_coriolis = true 
+use_coriolis = false
 seed = 42
+# optional explicit case inputs, .npy: (N, 3, 3) gradients and (N, 3) coriolis vectors.
+# when unset, cases are sampled from a sobol sequence using num_samples and seed;
+# when set, file length wins and num_samples is ignored.
+# grad_u_location = "data/grad_u.npy"
+# coriolis_location = "data/coriolis.npy"
 
 [single]
 grad_u = [
-    [1.0, 0.0, 0.0],
-    [0.0, -0.5, 0.0],
-    [0.0, 0.0, -0.5],
+    [-1.0, 0.0, 0.0],
+    [0.0, +1, 0.0],
+    [0.0, 0.0, 0.0],
 ]
+omega = [0.0, 0.0, 0.0]
+
+# piecewise-constant gradients, used only when [run_type].stages is true.
+# stage i applies grad_u[i] for st_max[i] of its own strain time, so the run
+# spans St = 0 to sum(st_max) and [params].st_max is ignored.
+
+[stages]
+grad_u = [
+    [[-0.5, 0.0, 0.0], [0.0, 0.5, 0.0], [0.0, 0.0, 0.0]], #G1
+    [[0.0, -0.5, 0.0], [-0.5, 0.0, 0.0], [0.0, 0.0, 0.0]], #G2
+]
+st_max = [1.0, 1.0]
 omega = [0.0, 0.0, 0.0]

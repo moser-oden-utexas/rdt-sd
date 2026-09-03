@@ -61,7 +61,13 @@ def stopping_index(
 
     Args:
         ns (np.ndarray): Numerical solver state, shape (9, num_nodes, num_time_steps).
-        degree (int, optional): Highest spherical harmonic degree tested. Defaults to 40.
+        degree (int, optional): Highest spherical harmonic degree tested. Must be
+            `2 * (t // 4)` for a spherical design of degree t, the largest even
+            degree the design resolves reliably: `ps` integrates the product
+            `Y_lm * phi` of degree `l + deg(phi)`, so exactness needs `2l <= t`,
+            and odd degrees vanish identically since phi is even in k. thr is
+            calibrated at this degree by scripts/earlystopping_thresholds.py.
+            Defaults to 40.
         thr (float, optional): Threshold above which case is flagged. Defaults to 1.6e-4.
         kappa_init (np.ndarray | None, optional): Initial wavevectors, shape (3, num_nodes).
             Needed when compound distortions are used and ns[..., 0] does not
