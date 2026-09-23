@@ -1,4 +1,18 @@
-"""Numerically solves rdt velocity spectrum using diffrax on jax."""
+"""
+Numerically solves rdt velocity spectrum using diffrax on jax.
+
+Evolves velocity spectrum tensor phi_ij and wavevectors kappa_i under mean
+velocity gradient G_ij and frame rotation Omega_k:
+
+    dphi_ij/dt = -G_im phi_mj - G_jm phi_im
+               + 2 G_nm (kappa_i kappa_n phi_mj + kappa_j kappa_n phi_im) / |kappa|^2
+               - 2 Omega_k (P_il eps_lkm phi_mj + P_jl eps_lkm phi_im)
+    dkappa_i/dt = -G_ji kappa_j
+
+Coriolis forcing is carried through divergence-free projector
+P_il = delta_il - kappa_i kappa_l / |kappa|^2, so rapid pressure response to
+rotation is retained and kappa_i contracted on that term vanishes identically.
+"""
 
 from __future__ import annotations
 
@@ -12,6 +26,7 @@ import numpy as np
 from diffrax import Dopri5, ODETerm, PIDController, SaveAt, diffeqsolve
 
 from src.spherical_designs import init_wavenumbers_spherical_designs
+from src.tensor_utils import EPS
 
 jax.config.update("jax_enable_x64", True)
 logging.getLogger("jax._src.xla_bridge").setLevel(logging.WARNING)
@@ -30,12 +45,6 @@ def _unpack_phi(phi6: jnp.ndarray) -> jnp.ndarray:
 def _pack_phi(phi: jnp.ndarray) -> jnp.ndarray:
     """Sends (3, 3, ...) to (6, ...)."""
     return jnp.array([phi[0, 0], phi[1, 1], phi[2, 2], phi[0, 1], phi[0, 2], phi[1, 2]])
-
-
-def _skew(omega: jnp.ndarray) -> jnp.ndarray:
-    """Builds skew-symmetric W such that W v = omega x v for all v."""
-    wx, wy, wz = omega
-    return jnp.array([[0.0, -wz, wy], [wz, 0.0, -wx], [-wy, wx, 0.0]])
 
 
 def _project_div_free(y: jnp.ndarray) -> jnp.ndarray:
@@ -65,8 +74,11 @@ def _rhs_tau_k(
     dphi += 2.0 / kk * jnp.einsum("lk, i, l, kj -> ij", grad_u, k, k, phi)
     dphi += 2.0 / kk * jnp.einsum("lk, j, l, ik -> ij", grad_u, k, k, phi)
 
-    w = _skew(omega)
-    dphi += -2.0 * (w @ phi + phi @ w.T)
+    # coriolis forcing carried through divergence-free projector, so rapid
+    # pressure response to rotation is retained
+    p = jnp.eye(3) - jnp.outer(k, k) / kk
+    dphi += -2.0 * jnp.einsum("k, il, lkm, mj -> ij", omega, p, EPS, phi)
+    dphi += -2.0 * jnp.einsum("k, jl, lkm, im -> ij", omega, p, EPS, phi)
 
     # compute dk/dτ, frozen at Y0 when evolve_k is disabled
     dk = -k @ grad_u if evolve_k else jnp.zeros_like(k)
@@ -140,6 +152,8 @@ def _solve_single(
             k3 = _rhs_tau(t_prev + 0.5 * h, y_prev + 0.5 * h * k2, args)
             k4 = _rhs_tau(t_prev + h, y_prev + h * k3, args)
             y_next = y_prev + (h / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+        # rhs preserves kappa_i phi_ij = 0 analytically, so this only clears
+        # integration drift off that constraint
         y_next = _project_div_free(y_next)
         return (t_next, y_next), y_next
 
