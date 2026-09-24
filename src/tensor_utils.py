@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import itertools
+import math
 from itertools import permutations
 
 import numpy as np
@@ -24,6 +25,12 @@ def get_array_module(arr):
 EPS = np.zeros((3, 3, 3), dtype=float)
 EPS[0, 1, 2] = EPS[1, 2, 0] = EPS[2, 0, 1] = 1.0
 EPS[0, 2, 1] = EPS[2, 1, 0] = EPS[1, 0, 2] = -1.0
+
+# spectrum normalization constant shared by every wavenumber integral
+C_PRE = 0.15
+
+# maps (i, j) to packed phi row in sol, rows ordered 00, 11, 22, 01, 02, 12
+PHI_INDEX = np.array([[0, 3, 4], [3, 1, 5], [4, 5, 2]])
 
 
 def flatten_q(q):
@@ -220,18 +227,83 @@ def model_spectrum(sol: np.ndarray, mean_velocity_gradient: np.ndarray) -> np.nd
     return join_solution(phi_model, kappa)
 
 
+def _directional_moment(sol, order):
+    """
+    Integrates phi_ij times products of unit wavevectors over wavenumbers.
+
+    Evaluates C * 4 pi / N * sum_k phi_ij n_a1 ... n_a<order>, with n = k / |k|.
+    Only the unique products of n are formed, and the node sum is one matrix
+    product per case, so no (3, 3, b, t, k) phi or full product tensor is built.
+
+    Args:
+        sol: Solution array, shape (b, t, 9, k). Can be numpy or cupy.
+        order (int): Number of unit-wavevector factors.
+
+    Returns:
+        Moment tensor, shape (3, 3) + (3,) * order + (b, t).
+    """
+    xp = get_array_module(sol)
+    assert not xp.iscomplexobj(sol), "sol must be real."
+    b, t, _, N = sol.shape
+
+    combos = list(itertools.combinations_with_replacement(range(3), order))
+    combo_index = np.empty((3,) * order, dtype=int)
+    for idx in np.ndindex(combo_index.shape):
+        combo_index[idx] = combos.index(tuple(sorted(idx)))
+
+    packed = xp.empty((b, t, 6, len(combos)), dtype=sol.dtype)
+    # one case at a time bounds memory held by wavevector products
+    for case in range(b):
+        k = sol[case, :, 6:, :]  # (t, 3, k)
+        n = k / xp.sqrt(xp.sum(k * k, axis=1, keepdims=True))
+        n_products = xp.stack(
+            [math.prod(n[:, a] for a in combo) for combo in combos], axis=1
+        )  # (t, combos, k)
+        packed[case] = sol[case, :, :6, :] @ xp.swapaxes(n_products, -1, -2)
+
+    # expand packed (phi row, combo) pairs to full index tensor
+    rows = xp.asarray(PHI_INDEX.reshape((3, 3) + (1,) * order))
+    cols = xp.asarray(combo_index.reshape((1, 1) + combo_index.shape))
+    moment = packed[..., rows, cols]  # (b, t, 3, 3, 3, ...)
+    moment = xp.moveaxis(moment, (0, 1), (-2, -1))
+
+    return C_PRE * 4 * xp.pi / N * moment
+
+
+def _D_from_M(M_ijpq):
+    """From M_ijpq (3, 3, 3, 3, b, t) to D_ij (3, 3, b, t)."""
+    xp = get_array_module(M_ijpq)
+    return xp.einsum("nnij... -> ij...", M_ijpq)
+
+
+def _Q_from_M(M_ijpq):
+    """From M_ijpq (3, 3, 3, 3, b, t) to Q_ijk (3, 3, 3, b, t)."""
+    xp = get_array_module(M_ijpq)
+    return xp.einsum("ipq, jqpr... -> ijr...", xp.asarray(EPS), M_ijpq)
+
+
+def _L_from_M6(M6):
+    """From sixth-order moment (3, 3, 3, 3, 3, 3, b, t) to L_ijpq."""
+    xp = get_array_module(M6)
+    return xp.einsum("nnijpq... -> ijpq...", M6)
+
+
+def _J_from_M6(M6):
+    """From sixth-order moment (3, 3, 3, 3, 3, 3, b, t) to J_ijrpq."""
+    xp = get_array_module(M6)
+    return xp.einsum("ins, sjnrpq... -> ijrpq...", xp.asarray(EPS), M6)
+
+
 def get_R_ij(sol):
     """From sol (b, t, 9, k) to R_ij (3, 3, b, t)."""
     xp = get_array_module(sol)
-    C = 0.15
+    N = sol.shape[-1]  # number of wavenumbers
 
-    phi, _ = split_solution(sol)
-    N = phi.shape[-1]  # number of wavenumbers
-
-    integral = xp.sum(phi, axis=-1)  # (i, j, b, t)
+    integral = xp.sum(sol[:, :, :6, :], axis=-1)[..., xp.asarray(PHI_INDEX)]
+    integral = xp.moveaxis(integral, (0, 1), (-2, -1))  # (i, j, b, t)
     integral *= 4 * xp.pi / N
 
-    return C * integral
+    return C_PRE * integral
 
 
 def get_q2(sol):
@@ -244,45 +316,12 @@ def get_q2(sol):
 
 def get_D_ij(sol):
     """From sol (b, t, 9, k) to D_ij (3, 3, b, t)."""
-    xp = get_array_module(sol)
-    C = 0.15
-
-    phi, k = split_solution(sol)
-    N = k.shape[-1]  # number of wavenumbers
-
-    # compute k² = |k|² for each wavenumber
-    # k: (3, b, t, k)
-    kk = xp.sum(k**2, axis=0)  # shape: (b, t, k)
-
-    # compute sum_k (Φ_nn * k_i * k_j / k²)
-    integral = xp.einsum("nnbtk, ibtk, jbtk, btk -> ijbt", phi, k, k, 1.0 / kk)
-    integral *= 4 * xp.pi / N
-
-    return C * integral
+    return _D_from_M(get_M_ijpq(sol))
 
 
 def get_Q_ijk(sol):
     """From sol (b, t, 9, k) to Q_ijk (3, 3, 3, b, t)."""
-    xp = get_array_module(sol)
-    C = 0.15
-
-    phi, k = split_solution(sol)
-    N = k.shape[-1]  # number of wavenumbers
-
-    # compute k² = |k|² for each wavenumber
-    # k: (3, b, t, k)
-    kk = xp.sum(k**2, axis=0)  # shape: (b, t, k)
-
-    # convert EPS to same array type
-    eps = xp.asarray(EPS)
-
-    # compute sum_k e_ipq * (Φ_jq * k_p * k_r / k²)
-    integral = xp.einsum(
-        "ipq, jqbtk, pbtk, rbtk, btk -> ijrbt", eps, phi, k, k, 1.0 / kk
-    )
-    integral *= 4 * xp.pi / N
-
-    return C * integral
+    return _Q_from_M(get_M_ijpq(sol))
 
 
 def fully_symmetrize_tensor(tensor):
@@ -302,21 +341,7 @@ def get_Qs_ijk(sol):
 
 def get_M_ijpq(sol):
     """From sol (b, t, 9, k) to M_ijpq (3, 3, 3, 3, b, t)."""
-    xp = get_array_module(sol)
-    C = 0.15
-
-    phi, k = split_solution(sol)
-    N = k.shape[-1]  # number of wavenumbers
-
-    # compute k² = |k|² for each wavenumber
-    # k: (3, b, t, k)
-    kk = xp.sum(k**2, axis=0)  # shape: (b, t, k)
-
-    # compute sum_k (Φ_ij * k_p * k_q / k²)
-    integral = xp.einsum("ijbtk, pbtk, qbtk, btk -> ijpqbt", phi, k, k, 1.0 / kk)
-    integral *= 4 * xp.pi / N
-
-    return C * integral
+    return _directional_moment(sol, 2)
 
 
 def get_Ms_ijpq(sol):
@@ -328,56 +353,12 @@ def get_Ms_ijpq(sol):
 
 def get_L_ijpq(sol):
     """From sol (b, t, 9, k) to L_ijpq (3, 3, 3, 3, b, t)."""
-    xp = get_array_module(sol)
-    C = 0.15
-
-    phi, k = split_solution(sol)
-    N = k.shape[-1]
-
-    # compute k⁴ = |k|⁴ for each wavenumber
-    # k: (3, b, t, k)
-    kk = xp.sum(k**2, axis=0)  # shape: (b, t, k)
-    kkkk = kk**2
-
-    # compute sum_k (Φ_nn * k_i * k_j * k_p * k_q / k⁴)
-    integral = xp.einsum(
-        "nnbtk, ibtk, jbtk, pbtk, qbtk, btk -> ijpqbt", phi, k, k, k, k, 1.0 / kkkk
-    )
-    integral *= 4 * xp.pi / N
-
-    return C * integral
+    return _L_from_M6(_directional_moment(sol, 4))
 
 
 def get_J_ijrpq(sol):
     """From sol (b, t, 9, k) to J_ijrpq (3, 3, 3, 3, 3, b, t)."""
-    xp = get_array_module(sol)
-    C = 0.15
-
-    phi, k = split_solution(sol)
-    N = k.shape[-1]
-
-    # compute k⁴ = |k|⁴ for each wavenumber
-    # k: (3, b, t, k)
-    kk = xp.sum(k**2, axis=0)  # shape: (b, t, k)
-    kkkk = kk**2
-
-    # convert EPS to same array type
-    eps = xp.asarray(EPS)
-
-    # compute sum_k e_ins * (Φ_sj * k_n * k_r * k_p * k_q / k⁴)
-    integral = xp.einsum(
-        "ins, sjbtk, nbtk, rbtk, pbtk, qbtk, btk -> ijrpqbt",
-        eps,
-        phi,
-        k,
-        k,
-        k,
-        k,
-        1.0 / kkkk,
-    )
-    integral *= 4 * xp.pi / N
-
-    return C * integral
+    return _J_from_M6(_directional_moment(sol, 4))
 
 
 def get_anisotropy(A_ij):
@@ -457,23 +438,30 @@ def compute_structure_tensors(sol_subset):
     """
     Computes structure tensors for sol subset.
 
+    Evaluates the second- and fourth-order directional moments once and derives
+    every tensor from them.
+
     Args:
         sol_subset: Solution subset with shape (batch, time, 9, k). Can be numpy or cupy.
 
     Returns:
         dict: Maps tensor names to arrays with shape (..., batch, time).
     """
+    R_ij = get_R_ij(sol_subset)
+    M_ijpq = _directional_moment(sol_subset, 2)
+    M6 = _directional_moment(sol_subset, 4)
+    Q_ijk = _Q_from_M(M_ijpq)
 
     tensors = {
-        "R_ij": get_R_ij(sol_subset),
-        "D_ij": get_D_ij(sol_subset),
-        "Q_ijk": get_Q_ijk(sol_subset),
-        "Qs_ijk": get_Qs_ijk(sol_subset),
-        "M_ijpq": get_M_ijpq(sol_subset),
-        "Ms_ijpq": get_Ms_ijpq(sol_subset),
-        "L_ijpq": get_L_ijpq(sol_subset),
-        "J_ijrpq": get_J_ijrpq(sol_subset),
-        "q2": get_q2(sol_subset) 
+        "R_ij": R_ij,
+        "D_ij": _D_from_M(M_ijpq),
+        "Q_ijk": Q_ijk,
+        "Qs_ijk": fully_symmetrize_tensor(Q_ijk),
+        "M_ijpq": M_ijpq,
+        "Ms_ijpq": fully_symmetrize_tensor(M_ijpq),
+        "L_ijpq": _L_from_M6(M6),
+        "J_ijrpq": _J_from_M6(M6),
+        "q2": get_array_module(R_ij).trace(R_ij, axis1=0, axis2=1),
     }
 
     return tensors

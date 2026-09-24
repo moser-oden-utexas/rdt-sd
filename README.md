@@ -9,7 +9,7 @@ wavevector grids, either as an ensemble of sampled cases or a single case.
 
 | Stage | Module | What it does |
 | --- | --- | --- |
-| Sampling | `src/sampler.py` | Draws 7 parameters via a Sobol sequence — 4 shaping the mean velocity gradient (strain/rotation blend), 3 the Coriolis vector. Ensemble runs only; single-case runs supply `grad_u`/`omega` directly. |
+| Sampling | `src/sampler.py` | Draws 7 parameters — 4 shaping the mean velocity gradient (strain/rotation blend), 3 the Coriolis vector — under the scheme named by `[ensemble] sampler`. Ensemble runs only; single-case runs supply `grad_u`/`omega` directly. |
 | Grids | `src/spherical_designs.py` | Loads the spherical t-design wavevector grid. Checks `grids/` first; on a miss, downloads from UNSW and caches. |
 | Solving | `src/rdt_solver.py` | Integrates the RDT ODE system with JAX/diffrax, using adaptive `dopri5` or fixed-step `rk4`. |
 | Saving | `scripts/launcher.py` | Writes to `results/<run_name>/`: one `phi_batch_{i}.npy` per batch for ensembles, or a single `phi_single.npy`. |
@@ -106,7 +106,13 @@ otherwise supplies `batch_size`, `use_coriolis`, `sd_degree`, and `solver`;
 Writes `results/<run_name>_train/` and one `results/<run_name>_test_st<St>/`
 per test value, each with the same layout as a single `scripts.launcher` +
 `scripts.postprocessing` + `scripts.ml_postprocessing` run, including its own
-`ml/` dataset directory.
+`ml/` dataset directory. Each batch is postprocessed in memory as soon as it is
+simulated, so `phi_batch_{i}.npy` files are only written when `--save_phi` is
+passed.
+
+The solver splits each batch across one JAX CPU device per core
+(`NUM_CPU_DEVICES` in `src/rdt_solver.py`), so `batch_size` works best as a
+multiple of the core count; other sizes are padded with copies of the last case.
 
 ### Visualizing Anisotropy 
 
@@ -132,10 +138,31 @@ must be placed there under those names before plotting.
 - `[params]` — args shared by all modes: `num_time_steps`, `sd_degree`,
   `st_max`, and `solver` (`"dopri5"` or `"rk4"`). In `stages` mode `st_max` is
   ignored, since it comes per stage from `[stages]`.
-- `[ensemble]` — ensemble-only args: `num_samples`, `batch_size`, `seed`, and
-  `use_coriolis`. `use_coriolis` is the Coriolis switch: `true` samples Coriolis
-  vectors and applies them, `false` runs without rotation. Set `[run] name` per
-  case so the two ensembles land in separate directories. `case_offset` and
+- `[ensemble]` — ensemble-only args: `num_samples`, `batch_size`, `seed`,
+  `sampler`, and `use_coriolis`. `use_coriolis` is the Coriolis switch: `true`
+  samples Coriolis vectors and applies them, `false` runs without rotation. Set
+  `[run] name` per case so the two ensembles land in separate directories.
+  `sampler` selects the sampling scheme and defaults to `"saltelli"`:
+
+  - `"saltelli"` keeps the leading rows of the cross-sampled matrix SALib builds
+    for Sobol *sensitivity analysis*. Those rows are deliberately correlated —
+    each base point spawns `2 * D + 2` rows differing in a single coordinate — so
+    a prefix of them covers the parameter space far more coarsely than its case
+    count suggests. At `num_samples = 256` with Coriolis, the 256 cases come from
+    16 base points, every parameter takes only 32 distinct values, and 96 cases
+    duplicate another case's mean velocity gradient outright.
+  - `"sobol"` draws a true scrambled Sobol design, one point per case, via
+    `scipy.stats.qmc`. Balance properties hold best when `num_samples` is a power
+    of two. Prefer this for new datasets.
+
+  The default is the weaker scheme only because it generated every dataset
+  produced so far, and `scripts/ml_postprocessing.py` re-derives each run's
+  gradients from its config rather than from saved values — so changing the
+  default would silently repoint existing runs at different cases. Runs written
+  by `scripts/build_ml_datasets.py` record the resolved `sampler` in their
+  `config.toml`, and configs predating the key resolve as `"saltelli"`.
+
+  `case_offset` and
   `total_num_samples` are optional and only set by `scripts/build_ml_datasets.py`:
   when present, cases are sampled as `total_num_samples` and sliced down to
   `num_samples` starting at `case_offset`, instead of sampling `num_samples`
@@ -160,13 +187,20 @@ must be placed there under those names before plotting.
   duration from `strain_rate(grad_u[i])` — starting from the state stage `i - 1`
   ended on. So `grad_u = [G1, G2]` with `st_max = [1.0, 1.0]` runs `G1` over
   `St = 0 -> 1` and `G2` over `St = 1 -> 2`, and the run spans `sum(st_max)` in
-  total. `num_time_steps` is the total across all stages, allocated
-  proportionally to each stage's `St` span, so snapshots land on one globally
-  uniform `St` grid and the saved `phi_single.npy` has the same
-  `(num_time_steps, 9, n_wavevectors)` layout as a `[single]` run —
-  `scripts/postprocessing.py` consumes it unchanged. Alongside it the run
-  directory gets `st_axis.npy`, shape (num_time_steps,), and `kappa_init.npy`,
-  shape (3, n_wavevectors), holding the undeformed spherical-design wavevectors.
+  total. Here `num_time_steps` counts *integration steps*, not saved nodes as
+  in `[single]` and `[ensemble]` runs: the steps are split evenly across
+  stages, with any remainder going to the earliest stages, and the initial
+  condition at `St = 0` is saved on top. So `num_time_steps = 100` over two
+  stages gives 50 steps each and `phi_single.npy` has shape
+  `(num_time_steps + 1, 9, n_wavevectors)` — one more snapshot than a
+  `[single]` run at the same setting. Every stage resolves its own span with
+  the same number of steps regardless of that span's length, so `St` spacing is
+  uniform within a stage but differs between stages whose `st_max` entries
+  differ, and each interior breakpoint is itself a saved snapshot.
+  `scripts/postprocessing.py` consumes the array unchanged. Alongside it the
+  run directory gets `st_axis.npy`, shape (num_time_steps + 1,), and
+  `kappa_init.npy`, shape (3, n_wavevectors), holding the undeformed
+  spherical-design wavevectors.
 
 ## Scripts
 

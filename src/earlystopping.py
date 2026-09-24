@@ -115,6 +115,126 @@ def stopping_index(
     return None
 
 
+def degree_modes(
+    kappa_init: np.ndarray, degree: int, chunk_size: int = 8192
+) -> np.ndarray:
+    """
+    Builds real spherical harmonics of one degree at initial wavevector directions.
+
+    Only tested degree's block of harmonic basis is retained, built in node chunks,
+    so peak memory holds chunk_size * (degree + 1)^2 values instead of
+    num_nodes * (degree + 1)^2, of which all but 2 * degree + 1 columns per node
+    go unused.
+
+    Args:
+        kappa_init (np.ndarray): Initial wavevectors, shape (3, num_nodes).
+        degree (int): Spherical harmonic degree.
+        chunk_size (int, optional): Number of nodes whose harmonics are built at
+            once. Defaults to 8192.
+
+    Returns:
+        np.ndarray: Harmonics of given degree, shape (num_nodes, 2 * degree + 1).
+    """
+    kx, ky, kz = kappa_init[0, ...], kappa_init[1, ...], kappa_init[2, ...]
+    theta = np.arctan2(ky, kx)
+    r = np.sqrt(kx**2 + ky**2 + kz**2)
+    phi_angle = np.arccos(np.clip(kz / r, -1.0, 1.0))
+
+    x = np.sin(phi_angle) * np.cos(theta)
+    y = np.sin(phi_angle) * np.sin(theta)
+    z = np.cos(phi_angle)
+
+    # xyz at t0 used for all t, as in stopping_index
+    xyz = np.column_stack([x.ravel(), y.ravel(), z.ravel()])  # (N, 3)
+
+    # retain only tested degree's orders, columns degree^2 : (degree + 1)^2
+    sh = sphericart.SphericalHarmonics(degree)
+    first, last = degree * degree, (degree + 1) ** 2
+    num_nodes = xyz.shape[0]
+    modes = np.empty((num_nodes, last - first))
+    for start in range(0, num_nodes, chunk_size):
+        stop = start + chunk_size
+        modes[start:stop] = sh.compute(xyz[start:stop])[:, first:last]
+
+    return modes
+
+
+def stopping_index_from_modes(
+    phi: np.ndarray, modes: np.ndarray, thr: float = 1.6e-4
+) -> int | None:
+    """
+    Returns stopping index beyond which E^{l_max} / E_total >= thr, given harmonics.
+
+    Orders of tested degree are summed by one matrix product, and every time step
+    is evaluated in that same product.
+
+    Args:
+        phi (np.ndarray): Packed spectrum, shape (num_time_steps, 6, num_nodes).
+        modes (np.ndarray): Harmonics of tested degree from `degree_modes`, shape
+            (num_nodes, 2 * degree + 1).
+        thr (float, optional): Threshold above which case is flagged. Defaults to 1.6e-4.
+
+    Returns:
+        int | None: Time step index where threshold is first reached, or
+            None if threshold is never reached.
+    """
+    assert not np.iscomplexobj(phi), "phi must be real."
+
+    # contiguous so product below stays in BLAS
+    phi = np.ascontiguousarray(phi)
+    num_time_steps, _, num_nodes = phi.shape
+    quadrature = 4.0 * np.pi / num_nodes
+
+    E_phi = quadrature * np.einsum("tin, tin -> t", phi, phi)
+
+    coefficients = quadrature * (phi.reshape(-1, num_nodes) @ modes)
+    lmode_phi = (coefficients * coefficients).sum(axis=-1)
+    lmode_phi = lmode_phi.reshape(num_time_steps, -1).sum(axis=-1)
+
+    crossed = lmode_phi / E_phi >= thr
+
+    return int(np.argmax(crossed)) if crossed.any() else None
+
+
+def fast_stopping_index(
+    ns: np.ndarray,
+    degree: int = 40,
+    thr: float = 1.6e-4,
+    kappa_init: np.ndarray | None = None,
+    chunk_size: int = 8192,
+) -> int | None:
+    """
+    Returns stopping index beyond which E^{l_max} / E_total >= thr.
+
+    Vectorized equivalent of `stopping_index`, returning same index for same
+    input, built from `degree_modes` and `stopping_index_from_modes`. Evaluating
+    every time step forgoes early exit of `stopping_index`, which is worth it
+    since the product costs far less than the loop it replaces.
+
+    Args:
+        ns (np.ndarray): Numerical solver state, shape (9, num_nodes, num_time_steps).
+        degree (int, optional): Highest spherical harmonic degree tested. Must be
+            `2 * (t // 4)` for a spherical design of degree t, as for
+            `stopping_index`. Defaults to 40.
+        thr (float, optional): Threshold above which case is flagged. Defaults to 1.6e-4.
+        kappa_init (np.ndarray | None, optional): Initial wavevectors, shape (3, num_nodes).
+            Needed when compound distortions are used and ns[..., 0] does not
+            contain the initial wavevectors. Defaults to None, which uses ns[..., 0].
+        chunk_size (int, optional): Number of nodes whose harmonics are built at
+            once. Defaults to 8192.
+
+    Returns:
+        int | None: Time step index where threshold is first reached, or
+            None if threshold is never reached.
+    """
+    if kappa_init is None:
+        kappa_init = ns[6:, :, 0]
+    modes = degree_modes(kappa_init, degree, chunk_size=chunk_size)
+
+    # (6, N, T) to (T, 6, N)
+    return stopping_index_from_modes(ns[:6].transpose(2, 0, 1), modes, thr=thr)
+
+
 def batched_stopping_index(
     sol: np.ndarray,
     degree: int = 40,
@@ -124,6 +244,9 @@ def batched_stopping_index(
     """
     Returns stopping index per case in batch of solver states.
 
+    Harmonic basis is built once for the whole batch, since every case starts
+    from the same wavevectors.
+
     Args:
         sol (np.ndarray): Numerical solver states, shape
             (batch, num_time_steps, 9, num_nodes).
@@ -131,17 +254,26 @@ def batched_stopping_index(
         thr (float, optional): Threshold above which case is flagged. Defaults to 1.6e-4.
         kappa_init (np.ndarray | None, optional): Initial wavevectors, shape
             (3, num_nodes), shared across every case in the batch. Defaults to
-            None, which uses each case's own sol[case, 0].
+            None, which uses sol[:, 0], shared by every case.
 
     Returns:
         np.ndarray: Stopping index per case, shape (batch,), dtype int. Cases
             that never cross thr are assigned num_time_steps.
+
+    Raises:
+        ValueError: If kappa_init is None and cases start from different wavevectors.
     """
+    if kappa_init is None:
+        kappa_init = sol[0, 0, 6:]
+        if not np.all(sol[:, 0, 6:] == kappa_init):
+            raise ValueError("Every case must start from the same wavevectors.")
+    modes = degree_modes(kappa_init, degree)
+
     num_time_steps = sol.shape[1]
     es_array = np.empty(sol.shape[0], dtype=int)
 
     for case in tqdm(range(sol.shape[0]), desc="early stopping"):
-        index = stopping_index(sol[case].transpose(1, 2, 0), degree=degree, thr=thr, kappa_init=kappa_init)
+        index = stopping_index_from_modes(sol[case, :, :6], modes, thr=thr)
         es_array[case] = num_time_steps if index is None else index
 
     return es_array

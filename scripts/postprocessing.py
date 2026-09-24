@@ -14,6 +14,7 @@ Outputs:
 import argparse
 import logging
 import pickle
+from collections.abc import Iterable
 from pathlib import Path
 
 import numpy as np
@@ -49,7 +50,11 @@ def _load_phi_array(path: Path) -> np.ndarray:
 
 
 def _process_shard(
-    phi_array: np.ndarray, es_degree: int, es_threshold: float, es_only: bool
+    phi_array: np.ndarray,
+    es_degree: int,
+    es_threshold: float,
+    es_only: bool,
+    enforce_earlystopping: bool,
 ) -> tuple[dict | None, np.ndarray]:
     """
     Computes structure tensors and early-stopping indices for one shard.
@@ -59,6 +64,9 @@ def _process_shard(
         es_degree (int): Highest spherical harmonic degree tested for early stopping.
         es_threshold (float): Threshold above which case is flagged as stopped.
         es_only (bool): Skips structure tensor computation when True.
+        enforce_earlystopping (bool): Runs batched_stopping_index when True.
+            When False, every case is marked as never stopped, skipping the
+            spherical harmonic decomposition it requires.
 
     Returns:
         tuple[dict | None, np.ndarray]: Structure tensors, each shape
@@ -66,7 +74,11 @@ def _process_shard(
             index per case, shape (batch,).
     """
     structure_tensors = None if es_only else compute_structure_tensors(phi_array)
-    es_array = batched_stopping_index(phi_array, degree=es_degree, thr=es_threshold)
+    if enforce_earlystopping:
+        es_array = batched_stopping_index(phi_array, degree=es_degree, thr=es_threshold)
+    else:
+        batch, num_time_steps = phi_array.shape[:2]
+        es_array = np.full(batch, num_time_steps, dtype=int)
     return structure_tensors, es_array
 
 
@@ -98,20 +110,24 @@ def _concatenate_shards(
     return structure_tensors, es_array
 
 
-def main(
-    phi_arrays: list[Path],
+def postprocess_arrays(
+    phi_arrays: Iterable[np.ndarray],
     es_array_output: Path,
     es_degree: int,
     es_threshold: float,
     structure_tensors_output: Path | None = None,
     es_only: bool = False,
+    enforce_earlystopping: bool = True,
 ) -> None:
     """
-    Computes and saves structure tensors and early-stopping indices.
+    Computes and saves structure tensors and early-stopping indices from arrays.
+
+    Shards are consumed one at a time, so a lazy iterable keeps only one shard
+    in memory.
 
     Args:
-        phi_arrays (list[Path]): Paths to one or more saved phi arrays. Multiple
-            paths are treated as batch shards of one ensemble and concatenated.
+        phi_arrays (Iterable[np.ndarray]): Batch shards of one ensemble, each
+            shape (batch, time, 9, k), concatenated along batch axis.
         es_array_output (Path): Destination npy path for the combined es_array.
         es_degree (int): Highest spherical harmonic degree tested for early stopping.
         es_threshold (float): Threshold above which case is flagged as stopped.
@@ -120,10 +136,25 @@ def main(
             Defaults to None.
         es_only (bool, optional): Skips structure tensor computation, only
             computing and saving es_array. Defaults to False.
+        enforce_earlystopping (bool, optional): Runs the early-stopping check.
+            Defaults to True. Set False when wavevectors do not evolve (e.g.
+            evolve_k is False), so the entire trajectory is already valid and
+            the check's spherical harmonic decomposition can be skipped.
+
+    Raises:
+        ValueError: If es_only and enforce_earlystopping are both False, since
+            nothing would be computed.
     """
+    if es_only and not enforce_earlystopping:
+        raise ValueError(
+            "es_only requires enforce_earlystopping, otherwise nothing is computed."
+        )
+
     shard_results = [
-        _process_shard(_load_phi_array(path), es_degree, es_threshold, es_only)
-        for path in tqdm(phi_arrays, desc="phi array shards")
+        _process_shard(
+            phi_array, es_degree, es_threshold, es_only, enforce_earlystopping
+        )
+        for phi_array in tqdm(phi_arrays, desc="phi array shards")
     ]
     structure_tensors, es_array = _concatenate_shards(shard_results)
 
@@ -136,6 +167,45 @@ def main(
         with open(structure_tensors_output, "wb") as f:
             pickle.dump(structure_tensors, f)
         logger.info("Saved structure tensors to %s.", structure_tensors_output)
+
+
+def main(
+    phi_arrays: list[Path],
+    es_array_output: Path,
+    es_degree: int,
+    es_threshold: float,
+    structure_tensors_output: Path | None = None,
+    es_only: bool = False,
+    enforce_earlystopping: bool = True,
+) -> None:
+    """
+    Computes and saves structure tensors and early-stopping indices from saved files.
+
+    Loads each path lazily and hands it to postprocess_arrays.
+
+    Args:
+        phi_arrays (list[Path]): Paths to one or more saved phi arrays. Multiple
+            paths are treated as batch shards of one ensemble and concatenated.
+        es_array_output (Path): Destination npy path for the combined es_array.
+        es_degree (int): Highest spherical harmonic degree tested for early stopping.
+        es_threshold (float): Threshold above which case is flagged as stopped.
+        structure_tensors_output (Path | None, optional): Destination pkl path
+            for the combined structure tensors dict. Ignored when es_only.
+            Defaults to None.
+        es_only (bool, optional): Skips structure tensor computation, only
+            computing and saving es_array. Defaults to False.
+        enforce_earlystopping (bool, optional): Runs the early-stopping check.
+            Defaults to True.
+    """
+    postprocess_arrays(
+        (_load_phi_array(path) for path in phi_arrays),
+        es_array_output,
+        es_degree,
+        es_threshold,
+        structure_tensors_output=structure_tensors_output,
+        es_only=es_only,
+        enforce_earlystopping=enforce_earlystopping,
+    )
 
 
 if __name__ == "__main__":
@@ -178,10 +248,18 @@ if __name__ == "__main__":
         action="store_true",
         help="Skip structure tensor computation; only compute and save es_array.",
     )
+    parser.add_argument(
+        "--no_earlystopping",
+        action="store_true",
+        help="Skip the early-stopping check; mark every case as never stopped. "
+        "Use when wavevectors do not evolve, so the full trajectory is already valid.",
+    )
     args = parser.parse_args()
 
     if not args.es_only and args.structure_tensors_output is None:
         parser.error("--structure_tensors_output is required unless --es_only is set.")
+    if args.es_only and args.no_earlystopping:
+        parser.error("--es_only and --no_earlystopping cannot be combined.")
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     main(
@@ -191,4 +269,5 @@ if __name__ == "__main__":
         args.es_threshold,
         structure_tensors_output=args.structure_tensors_output,
         es_only=args.es_only,
+        enforce_earlystopping=not args.no_earlystopping,
     )

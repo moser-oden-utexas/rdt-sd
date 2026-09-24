@@ -17,6 +17,7 @@ rotation is retained and kappa_i contracted on that term vanishes identically.
 from __future__ import annotations
 
 import logging
+import os
 from functools import partial
 from pathlib import Path
 
@@ -24,11 +25,19 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from diffrax import Dopri5, ODETerm, PIDController, SaveAt, diffeqsolve
+from jax.sharding import Mesh, PartitionSpec
 
 from src.spherical_designs import init_wavenumbers_spherical_designs
 from src.tensor_utils import EPS
 
+# one host device per core, so ensemble batches are integrated in parallel
+NUM_CPU_DEVICES = os.cpu_count()
+
+# fewest cases each device integrates, so results match unsharded batches bitwise
+MIN_CASES_PER_DEVICE = 2
+
 jax.config.update("jax_enable_x64", True)
+jax.config.update("jax_num_cpu_devices", NUM_CPU_DEVICES)
 logging.getLogger("jax._src.xla_bridge").setLevel(logging.WARNING)
 
 def _unpack_phi(phi6: jnp.ndarray) -> jnp.ndarray:
@@ -161,7 +170,43 @@ def _solve_single(
     return jnp.concatenate([Y0[None, ...], ys], axis=0)
 
 
-@partial(jax.jit, static_argnums=(2, 4, 5, 6))
+@partial(jax.jit, static_argnums=(3, 4, 5, 6, 7))
+def _simulate_sharded(
+    grad_u: jnp.ndarray,
+    omega: jnp.ndarray,
+    tmax: jnp.ndarray,
+    num_time_steps: int,
+    sd_degree: int,
+    solver: str,
+    evolve_k: bool,
+    num_devices: int,
+) -> jnp.ndarray:
+    """Integrates batch sized to a multiple of num_devices, one slice per device."""
+    # built under jit, since eager evaluation rounds Y0 differently by an ulp
+    Y0 = initial_state(sd_degree)
+    tau_eval = jnp.linspace(0.0, 1.0, num_time_steps)
+
+    solve_batch = jax.vmap(
+        lambda g_u, om, tm, y0, tau: _solve_single(
+            y0, g_u, om, tm, tau, solver, evolve_k
+        ),
+        in_axes=(0, 0, 0, None, None),
+    )
+
+    # each device integrates its own slice of cases, so its adaptive loop only
+    # waits on its own slowest case
+    mesh = Mesh(np.array(jax.devices()[:num_devices]), ("batch",))
+    batch_spec, replicated_spec = PartitionSpec("batch"), PartitionSpec()
+    return jax.shard_map(
+        solve_batch,
+        mesh=mesh,
+        in_specs=(batch_spec, batch_spec, batch_spec, replicated_spec, replicated_spec),
+        out_specs=batch_spec,
+        # diffrax loop carries do not track varying manual axes, so check fails
+        check_vma=False,
+    )(grad_u, omega, tmax, Y0, tau_eval)
+
+
 def simulate_parallel(
     grad_u: np.ndarray | jnp.ndarray,
     tmax: np.ndarray | jnp.ndarray,
@@ -170,9 +215,13 @@ def simulate_parallel(
     sd_degree: int = 109,
     solver: str = "dopri5",
     evolve_k: bool = True,
-) -> tuple[jnp.ndarray, jnp.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     """
     Simulates RDT spectra for multiple cases in parallel with normalized time.
+
+    Cases are split evenly across up to NUM_CPU_DEVICES devices, each holding at
+    least MIN_CASES_PER_DEVICE cases, padding the batch with copies of its last
+    case when it does not split evenly.
 
     Args:
         grad_u: shape (batch, 3, 3)
@@ -197,31 +246,45 @@ def simulate_parallel(
     if solver not in ("dopri5", "rk4"):
         raise ValueError(f'Unknown solver: {solver!r}. Expected "dopri5" or "rk4".')
 
-    Y0 = initial_state(sd_degree)
-
-    grad_u_b = jnp.asarray(grad_u)
-    tmax_b = jnp.asarray(tmax)
+    grad_u_b = np.asarray(grad_u)
+    tmax_b = np.asarray(tmax)
     batch = grad_u_b.shape[0]
 
     if omega is None:
-        omega_b = jnp.zeros((batch, 3), dtype=grad_u_b.dtype)
+        omega_b = np.zeros((batch, 3), dtype=grad_u_b.dtype)
     else:
-        omega_arr = jnp.asarray(omega, dtype=grad_u_b.dtype)
+        omega_arr = np.asarray(omega, dtype=grad_u_b.dtype)
         omega_b = (
             omega_arr[None, :].repeat(batch, axis=0)
             if omega_arr.ndim == 1
             else omega_arr
         )
 
-    tau_eval = jnp.linspace(0.0, 1.0, num_time_steps)
+    # at least MIN_CASES_PER_DEVICE cases per device, since a single vmapped
+    # case compiles to different arithmetic than a batch of them
+    num_devices = max(1, min(jax.device_count(), batch // MIN_CASES_PER_DEVICE))
 
-    solve_single = lambda g_u, om, tm: _solve_single(
-        Y0, g_u, om, tm, tau_eval, solver, evolve_k
-    )
-    sol = jax.vmap(solve_single, in_axes=(0, 0, 0), out_axes=0)(
-        grad_u_b, omega_b, tmax_b
+    # pad batch to a multiple of num_devices by repeating last case
+    pad = -batch % num_devices
+    grad_u_p, omega_p, tmax_p = (
+        np.concatenate([a, np.repeat(a[-1:], pad, axis=0)])
+        for a in (grad_u_b, omega_b, tmax_b)
     )
 
+    sol = _simulate_sharded(
+        grad_u_p,
+        omega_p,
+        tmax_p,
+        num_time_steps,
+        sd_degree,
+        solver,
+        evolve_k,
+        num_devices,
+    )
+    # unpad outside jit, since sliced batch need not split evenly across devices
+    sol = np.asarray(sol)[:batch]
+
+    tau_eval = np.linspace(0.0, 1.0, num_time_steps)
     t_actual = tau_eval[None, :] * tmax_b[:, None]
 
     return sol, t_actual

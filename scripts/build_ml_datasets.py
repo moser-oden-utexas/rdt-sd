@@ -11,26 +11,28 @@ construction. `num_time_steps` is scaled per split so that
 
 Each split is run through the same pipeline as a single manual run: simulate
 (scripts/launcher.py), postprocess (scripts/postprocessing.py), and build the
-ML dataset (scripts/ml_postprocessing.py).
+ML dataset (scripts/ml_postprocessing.py). Each batch is postprocessed in memory
+as soon as it is simulated, so only one batch of spectra is held at a time.
 
 Outputs, under results/<run.name from --config>_train/ and
 results/<run.name>_test_st<St>/ for each test St:
-  phi_batch_*.npy, config.toml, structure_tensors.pkl, es_array.npy, and the
-  ml/ directory written by scripts/ml_postprocessing.py.
+  config.toml, structure_tensors.pkl, es_array.npy, the ml/ directory written by
+  scripts/ml_postprocessing.py, and phi_batch_*.npy when --save_phi is set.
 """
 
 import argparse
 import logging
 import tomllib
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 
 import numpy as np
 import tomli_w
 
 from scripts.launcher import simulate_ensemble_cases
-from scripts.postprocessing import main as postprocess
+from scripts.postprocessing import postprocess_arrays
 from scripts.ml_postprocessing import main as build_ml_dataset
-from src.sampler import resolve_case_parameters
+from src.sampler import DEFAULT_SAMPLER, resolve_case_parameters
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +49,25 @@ def _run_name(base_name: str, suffix: str) -> str:
         str: Run name with "." replaced by "p" for filesystem safety.
     """
     return f"{base_name}_{suffix}".replace(".", "p")
+
+
+def _save_batches(
+    phi_arrays: Iterable[np.ndarray], results_dir: Path
+) -> Iterator[np.ndarray]:
+    """
+    Saves each batch as phi_batch_<i>.npy while passing it through.
+
+    Args:
+        phi_arrays (Iterable[np.ndarray]): Batches of spectra, each shape
+            (batch, num_time_steps, 9, n_wavevectors).
+        results_dir (Path): Directory to save the batches in.
+
+    Yields:
+        np.ndarray: Each batch, unchanged.
+    """
+    for i, phi_array in enumerate(phi_arrays):
+        np.save(results_dir / f"phi_batch_{i}.npy", phi_array)
+        yield phi_array
 
 
 def _split_plan(
@@ -78,6 +99,7 @@ def main(
     test_num_cases: int,
     es_threshold: float,
     es_degree: int | None = None,
+    save_phi: bool = False,
 ) -> None:
     """
     Builds train and test ML datasets from one shared sampled case pool.
@@ -93,7 +115,11 @@ def main(
         es_threshold (float): Threshold above which case is flagged as stopped.
         es_degree (int | None, optional): Highest spherical harmonic degree
             tested for early stopping. Defaults to `2 * (sd_degree // 4)`, the
-            largest even degree the spherical design resolves reliably.
+            largest even degree the spherical design resolves reliably. Unused
+            when the config's evolve_k is False, since the early-stopping
+            check is skipped entirely in that case.
+        save_phi (bool, optional): Whether to save each batch of spectra as
+            phi_batch_<i>.npy. Defaults to False.
 
     Raises:
         ValueError: If the config does not describe an ensemble run, or if the
@@ -116,6 +142,7 @@ def main(
     use_coriolis = ensemble["use_coriolis"]
     grad_u_location = ensemble.get("grad_u_location")
     coriolis_location = ensemble.get("coriolis_location")
+    sampler = ensemble.get("sampler", DEFAULT_SAMPLER)
     sd_degree = params["sd_degree"]
     solver = params["solver"]
     evolve_k = params["evolve_k"]
@@ -134,6 +161,7 @@ def main(
         seed=seed,
         grad_u_location=grad_u_location,
         coriolis_location=coriolis_location,
+        sampler=sampler,
     )
 
     if mean_velocity_gradients.shape[0] < total_num_samples:
@@ -173,8 +201,8 @@ def main(
             batch_size=batch_size,
             evolve_k=evolve_k,
         )
-        for i, phi_array in enumerate(phi_arrays):
-            np.save(results_dir / f"phi_batch_{i}.npy", np.asarray(phi_array))
+        if save_phi:
+            phi_arrays = _save_batches(phi_arrays, results_dir)
 
         split_config = {
             "run": {"name": run_name},
@@ -191,6 +219,7 @@ def main(
                 "batch_size": batch_size,
                 "use_coriolis": use_coriolis,
                 "seed": seed,
+                "sampler": sampler,
                 "case_offset": offset,
                 "total_num_samples": total_num_samples,
             },
@@ -204,18 +233,15 @@ def main(
         with open(config_path, "wb") as f:
             tomli_w.dump(split_config, f)
 
-        phi_paths = sorted(
-            results_dir.glob("phi_batch_*.npy"),
-            key=lambda p: int(p.stem.rsplit("_", 1)[-1]),
-        )
         structure_tensors_path = results_dir / "structure_tensors.pkl"
         es_array_path = results_dir / "es_array.npy"
-        postprocess(
-            phi_paths,
+        postprocess_arrays(
+            phi_arrays,
             es_array_path,
             es_degree,
             es_threshold,
             structure_tensors_output=structure_tensors_path,
+            enforce_earlystopping=evolve_k,
         )
         build_ml_dataset(
             structure_tensors_path, es_array_path, config_path, results_dir / "ml"
@@ -272,6 +298,11 @@ if __name__ == "__main__":
         help="Highest spherical harmonic degree tested for early stopping. "
         "Defaults to 2 * (sd_degree // 4).",
     )
+    parser.add_argument(
+        "--save_phi",
+        action="store_true",
+        help="Save each batch of spectra as phi_batch_<i>.npy.",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -283,4 +314,5 @@ if __name__ == "__main__":
         args.test_num_cases,
         args.es_threshold,
         es_degree=args.es_degree,
+        save_phi=args.save_phi,
     )

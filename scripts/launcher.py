@@ -1,13 +1,14 @@
 """Launcher script for simulating rdt velocity spectra or spectrum."""
 
 import tomllib
+from collections.abc import Iterator
 from pathlib import Path
 
 import numpy as np
 import tomli_w
 from tqdm import tqdm
 
-from src.sampler import resolve_case_parameters
+from src.sampler import DEFAULT_SAMPLER, resolve_case_parameters
 from src.rdt_solver import (
     initial_state,
     simulate_from_state,
@@ -26,9 +27,12 @@ def simulate_ensemble_cases(
     solver: str = "dopri5",
     batch_size: int = 64,
     evolve_k: bool = True,
-) -> list[np.ndarray]:
+) -> Iterator[np.ndarray]:
     """
-    Integrates given cases in batches.
+    Integrates given cases in batches, yielding each batch as it finishes.
+
+    Only one batch is held at a time, so callers can save or postprocess it
+    before the next one is integrated.
 
     Args:
         mean_velocity_gradients (np.ndarray): Mean velocity gradients, shape
@@ -43,16 +47,13 @@ def simulate_ensemble_cases(
         evolve_k (bool, optional): Whether wavevectors evolve under the mean
             velocity gradient. Defaults to True.
 
-    Returns:
-        list[np.ndarray]: Per-batch spectrum arrays, each shape
+    Yields:
+        np.ndarray: Spectrum array of one batch, shape
             (batch, num_time_steps, 9, n_wavevectors).
     """
     num_cases = mean_velocity_gradients.shape[0]
     S = strain_rate(mean_velocity_gradients)
     t_max_array = np.array([st_max / s for s in S])
-
-    # evaluate over batches, do not save spectrum data
-    phi_arrays = []
 
     for i in tqdm(range(0, num_cases, batch_size)):
         batch_mean_velocity_gradients = mean_velocity_gradients[i : i + batch_size]
@@ -71,9 +72,7 @@ def simulate_ensemble_cases(
             evolve_k=evolve_k,
         )
 
-        phi_arrays.append(phi_array)
-
-    return phi_arrays
+        yield phi_array
 
 
 def launch_rdt_single(
@@ -134,15 +133,21 @@ def launch_rdt_stages(
     Launches RDT simulation for single case under piecewise-constant gradients.
 
     Stage i applies grad_u[i] for st_max[i] of its own strain time, starting
-    from the state stage i-1 ended on. Snapshots are taken on one globally
-    uniform St grid spanning 0 to sum(st_max), so the returned array has the
-    same layout as a plain single-case run.
+    from the state stage i-1 ended on. Integration steps are split evenly
+    across stages, and the initial condition at St = 0 is saved on top, so the
+    run holds num_time_steps + 1 snapshots. Unlike single-case runs, whose
+    num_time_steps counts saved nodes, here it counts integration steps.
+
+    Each stage resolves its own span with the same number of steps regardless
+    of how long that span is, so St spacing is uniform within a stage but
+    differs between stages whose st_max entries differ.
 
     Args:
         grad_u (np.ndarray): Per-stage velocity-gradient tensors, shape
             (num_stages, 3, 3).
         omega (np.ndarray): Coriolis rotation vector, shape (3,), shared by all stages.
-        num_time_steps (int): Total number of time steps across all stages.
+        num_time_steps (int): Total number of integration steps across all
+            stages, split evenly with any remainder going to earliest stages.
         sd_degree (int): Spherical design degree, sets initial spectrum and wavevectors.
         st_max (np.ndarray): Per-stage strain-time durations, shape (num_stages,).
             Stage i spans St = sum(st_max[:i]) to sum(st_max[:i + 1]).
@@ -151,12 +156,14 @@ def launch_rdt_stages(
             velocity gradient. Defaults to True.
 
     Returns:
-        tuple[np.ndarray, np.ndarray]: Spectrum array, shape (num_time_steps,
-            9, n_wavevectors), and its St axis, shape (num_time_steps,).
+        tuple[np.ndarray, np.ndarray]: Spectrum array, shape
+            (num_time_steps + 1, 9, n_wavevectors), and its St axis, shape
+            (num_time_steps + 1,).
 
     Raises:
-        ValueError: If grad_u and st_max disagree on the number of stages, or
-            if any stage has a non-positive strain-time duration.
+        ValueError: If grad_u and st_max disagree on the number of stages, if
+            any stage has a non-positive strain-time duration, or if
+            num_time_steps leaves any stage without a step.
     """
     grad_u = np.asarray(grad_u, dtype=float)
     omega = np.asarray(omega, dtype=float)
@@ -174,37 +181,48 @@ def launch_rdt_stages(
     if not np.all(spans > 0):
         raise ValueError(f"Every stage needs a positive st_max, got {spans.tolist()}.")
 
-    # global uniform St grid, with each point assigned to the stage it falls in.
-    # points landing exactly on an interior breakpoint go to the earlier stage.
+    num_stages = grad_u.shape[0]
+    if num_time_steps < num_stages:
+        raise ValueError(
+            f"num_time_steps must be at least the number of stages ({num_stages}), "
+            f"got {num_time_steps}."
+        )
+
+    # split integration steps evenly, remainder going to earliest stages
+    steps_per_stage = np.full(num_stages, num_time_steps // num_stages)
+    steps_per_stage[: num_time_steps % num_stages] += 1
+
     breaks = np.concatenate([[0.0], np.cumsum(spans)])
-    st_axis = np.linspace(0.0, breaks[-1], num_time_steps)
-    stage_of = np.searchsorted(breaks[1:-1], st_axis, side="left")
 
     Y = initial_state(sd_degree)
     phi_stages = []
+    st_stages = []
 
-    for i, g_u in enumerate(grad_u):
-        # normalized times this stage owns, plus the 0 and 1 endpoints needed
-        # to start from the carried state and hand off exactly at the breakpoint
-        local_tau = (st_axis[stage_of == i] - breaks[i]) / spans[i]
-        nodes = np.unique(np.concatenate([[0.0], local_tau, [1.0]]))
-        saved = np.isin(nodes, local_tau)
+    for i, (g_u, num_steps) in enumerate(zip(grad_u, steps_per_stage)):
+        # each stage owns uniform grid over its own normalized time
+        local_tau = np.linspace(0.0, 1.0, num_steps + 1)
 
         # derive tmax from this stage's own strain rate, as the single-case path does
         tmax = spans[i] / strain_rate(g_u[None, ...])[0]
 
         sol, _ = simulate_from_state(
-            Y, g_u, tmax, nodes, omega, solver=solver, evolve_k=evolve_k
+            Y, g_u, tmax, local_tau, omega, solver=solver, evolve_k=evolve_k
         )
         sol = np.asarray(sol)
 
-        phi_stages.append(sol[saved])
+        # stage 0 keeps its tau = 0 snapshot as run's initial condition; later
+        # stages drop theirs, since it repeats previous stage's final snapshot
+        keep = slice(None) if i == 0 else slice(1, None)
+        phi_stages.append(sol[keep])
+        st_stages.append((breaks[i] + local_tau * spans[i])[keep])
+
         Y = sol[-1]
 
     phi_array = np.concatenate(phi_stages, axis=0)
+    st_axis = np.concatenate(st_stages)
     assert (
-        phi_array.shape[0] == num_time_steps
-    ), "Stage snapshots must partition St grid."
+        phi_array.shape[0] == num_time_steps + 1
+    ), "Stage snapshots must total one initial condition plus num_time_steps steps."
 
     return phi_array, st_axis
 
@@ -238,6 +256,7 @@ def main() -> None:
             seed=ensemble["seed"],
             grad_u_location=ensemble.get("grad_u_location"),
             coriolis_location=ensemble.get("coriolis_location"),
+            sampler=ensemble.get("sampler", DEFAULT_SAMPLER),
         )
         ensemble["num_samples"] = mean_velocity_gradients.shape[0]
 
@@ -254,7 +273,7 @@ def main() -> None:
             **shared_params,
         )
         for i, phi_array in enumerate(phi_arrays):
-            np.save(results_dir / f"phi_batch_{i}.npy", np.asarray(phi_array))
+            np.save(results_dir / f"phi_batch_{i}.npy", phi_array)
     elif is_stages:
         # st_max comes from [stages], so params are passed explicitly rather
         # than splatted; [params].st_max is unused in this mode
