@@ -1,41 +1,82 @@
+import warnings
 from pathlib import Path
 
 from SALib.sample.sobol import sample
+from scipy.stats import qmc
 import numpy as np
 
-def sampling_parameters(num_cases: int, use_coriolis: bool, seed: int = 42) -> np.ndarray:
+DEFAULT_SAMPLER = "saltelli"
+SAMPLERS = ("saltelli", "sobol")
+
+
+def sampling_parameters(
+    num_cases: int,
+    use_coriolis: bool,
+    seed: int = 42,
+    sampler: str = DEFAULT_SAMPLER,
+) -> np.ndarray:
     """
-    Samples RDT parameters via Sobol sequence.
+    Samples RDT parameters over the parameter bounds.
 
     Always draws the 4 mean-velocity-gradient parameters (s1..s4). Draws the 3
     Coriolis parameters (c1..c3) too when `use_coriolis` is True, so every
-    sampled Sobol dimension maps onto a parameter that is actually used, and
-    the generated tensors stay as unique as the underlying Sobol sequence.
+    sampled dimension maps onto a parameter that is actually used.
+
+    Two sampling schemes are available. "saltelli" draws the cross-sampled
+    matrix SALib builds for Sobol sensitivity analysis and keeps its leading
+    rows. Those rows are deliberately correlated — each base point spawns
+    2*D + 2 rows that differ from one another in a single coordinate — so a
+    prefix of them covers the parameter space far more coarsely than its case
+    count suggests. It is the default only because it generated every dataset
+    produced so far. "sobol" draws a true scrambled Sobol design, one point per
+    case, and is the better choice for new datasets.
 
     Args:
         num_cases (int): Number of cases to sample.
         use_coriolis (bool): Whether to sample the Coriolis parameters.
-        seed (int, optional): Sobol sampler seed. Defaults to 42.
+        seed (int, optional): Sampler seed. Defaults to 42.
+        sampler (str, optional): Sampling scheme, "saltelli" or "sobol".
+            Defaults to "saltelli". Sobol balance properties hold best when
+            num_cases is a power of two.
 
     Returns:
         np.ndarray: Sampled parameters, shape (num_cases, 4) when use_coriolis
             is False, or (num_cases, 7) when True.
+
+    Raises:
+        ValueError: If sampler is not one of SAMPLERS.
     """
+    if sampler not in SAMPLERS:
+        raise ValueError(f"Unknown sampler: {sampler!r}. Expected one of {SAMPLERS}.")
+
     names = ["s1", "s2", "s3", "s4"]
     bounds = [[-1, 1], [-1, -0.5], [0, 2 * np.pi], [-1, 1]]
     if use_coriolis:
         names += ["c1", "c2", "c3"]
         bounds += [[0, 10], [0, 2 * np.pi], [-1, 1]]
 
-    problem = {"num_vars": len(names), "names": names, "bounds": bounds}
+    if sampler == "saltelli":
+        problem = {"num_vars": len(names), "names": names, "bounds": bounds}
 
-    # sobol sampler gives ((2 + D + D*(D-1)/2) * N cases
-    # where D is number of parameters
-    N = int(np.ceil(np.log2(num_cases)))
+        # saltelli sampler gives N * (2 * D + 2) rows, where D is number of
+        # parameters and N is number of base points
+        N = int(np.ceil(np.log2(num_cases)))
 
-    param_values = sample(problem, 2**N, seed=seed, calc_second_order=True)
+        param_values = sample(problem, 2**N, seed=seed, calc_second_order=True)
 
-    return param_values[:num_cases, :]
+        return param_values[:num_cases, :]
+
+    l_bounds = [low for low, _ in bounds]
+    u_bounds = [high for _, high in bounds]
+    engine = qmc.Sobol(d=len(names), scramble=True, seed=seed)
+
+    # scipy warns whenever num_cases is not power of two; that balance caveat
+    # is documented above rather than raised on every run
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        unit_samples = engine.random(num_cases)
+
+    return qmc.scale(unit_samples, l_bounds, u_bounds)
 
 
 def generate_mean_velocity_gradients(params):
@@ -179,7 +220,10 @@ def generate_coriolis_terms(params):
 
 
 def sample_case_parameters(
-    num_cases: int, use_coriolis: bool, seed: int = 42
+    num_cases: int,
+    use_coriolis: bool,
+    seed: int = 42,
+    sampler: str = DEFAULT_SAMPLER,
 ) -> tuple[np.ndarray, np.ndarray | None]:
     """
     Samples mean velocity gradients and, when enabled, Coriolis terms.
@@ -187,14 +231,18 @@ def sample_case_parameters(
     Args:
         num_cases (int): Number of cases to sample.
         use_coriolis (bool): Whether to sample and generate Coriolis terms.
-        seed (int, optional): Sobol sampler seed. Defaults to 42.
+        seed (int, optional): Sampler seed. Defaults to 42.
+        sampler (str, optional): Sampling scheme, "saltelli" or "sobol".
+            Defaults to "saltelli".
 
     Returns:
         tuple[np.ndarray, np.ndarray | None]: Mean velocity gradients, shape
             (num_cases, 3, 3), and Coriolis terms, shape (num_cases, 3), or
             None when use_coriolis is False.
     """
-    sampling_params = sampling_parameters(num_cases, use_coriolis, seed=seed)
+    sampling_params = sampling_parameters(
+        num_cases, use_coriolis, seed=seed, sampler=sampler
+    )
     mean_velocity_gradients = generate_mean_velocity_gradients(sampling_params[:, :4])
     coriolis_terms = (
         generate_coriolis_terms(sampling_params[:, 4:]) if use_coriolis else None
@@ -258,18 +306,19 @@ def resolve_case_parameters(
     seed: int = 42,
     grad_u_location: str | Path | None = None,
     coriolis_location: str | Path | None = None,
+    sampler: str = DEFAULT_SAMPLER,
 ) -> tuple[np.ndarray, np.ndarray | None]:
     """
-    Resolves the case pool, either by Sobol sampling or from explicit .npy files.
+    Resolves the case pool, either by sampling or from explicit .npy files.
 
-    Sobol sampling is the default. When `grad_u_location` is given, cases are
-    loaded from disk instead and `num_cases` and `seed` are ignored, so the pool
-    size is the number of entries in the file.
+    Sampling is the default. When `grad_u_location` is given, cases are loaded
+    from disk instead and `num_cases`, `seed` and `sampler` are ignored, so the
+    pool size is the number of entries in the file.
 
     Args:
         num_cases (int): Number of cases to sample. Ignored in file mode.
         use_coriolis (bool): Whether to use Coriolis terms.
-        seed (int, optional): Sobol sampler seed. Defaults to 42. Ignored in
+        seed (int, optional): Sampler seed. Defaults to 42. Ignored in
             file mode.
         grad_u_location (str | Path | None, optional): Path to .npy file holding
             mean velocity gradients, shape (num_cases, 3, 3). Defaults to None,
@@ -277,6 +326,8 @@ def resolve_case_parameters(
         coriolis_location (str | Path | None, optional): Path to .npy file holding
             Coriolis terms, shape (num_cases, 3). Defaults to None. Required
             alongside grad_u_location when use_coriolis is True.
+        sampler (str, optional): Sampling scheme, "saltelli" or "sobol".
+            Defaults to "saltelli". Ignored in file mode.
 
     Returns:
         tuple[np.ndarray, np.ndarray | None]: Mean velocity gradients, shape
@@ -294,7 +345,9 @@ def resolve_case_parameters(
         raise ValueError("coriolis_location requires use_coriolis to be true.")
 
     if grad_u_location is None:
-        return sample_case_parameters(num_cases, use_coriolis, seed=seed)
+        return sample_case_parameters(
+            num_cases, use_coriolis, seed=seed, sampler=sampler
+        )
 
     if use_coriolis and coriolis_location is None:
         raise ValueError("coriolis_location is required when use_coriolis is true.")
